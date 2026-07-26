@@ -216,3 +216,84 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Output from this tool -------------------------------------------------
+# Output inherits the personal data (client IPs) of the log it was built from.
+parsed_logs.csv
+parsed_logs.csv.gz
+skipped_lines.log
+*.tmp
+
+# Logs, sample or real. Never commit production logs: they contain client IPs
+# and user agents, which are personal data in most jurisdictions.
+*.log
+*.log.gz
+*.log.[0-9]
+server.log
+access.log
+error.log
+logs/
+
+# Keep small, anonymised fixtures if you add any:
+# !tests/fixtures/*.log
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Environments ----------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Testing and coverage --------------------------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache
+nosetests.xml
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# --- Editors and OS --------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Secrets ---------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
