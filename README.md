@@ -1,4 +1,4 @@
-# log_parser
+# LOG PARSER
 
 A log parser that works out the format of each line for itself.
 
@@ -7,11 +7,15 @@ the format, normalises everything into one consistent shape, writes a CSV, and
 prints a summary that stays one screen long no matter how big the input is.
 
 ```
-$ python parse_logs.py access.log
+$ python3 parse_logs.py access.log
 Starting log parsing on 'access.log'...
 Parsed 100 log lines. Saved results to 'parsed_logs.csv'.
 
 --- Summary ---
+
+!! 2 SUCCESSFUL requests to suspicious paths (of 14 attempted) - investigate first:
+       2  200 GET /.env from 203.0.113.9
+
 Formats detected    : combined (100)
 Unique IPs          : 100
 Mean response       : n/a (no durations in this log)
@@ -38,53 +42,60 @@ reports `n/a` for the mean instead of dividing by zero.
 ## Requirements
 
 Python 3.9 or newer. No third-party packages — standard library only.
+Developed and tested against 3.12.
 
 ```bash
 git clone <your-repo-url>
-cd log_parser
-python parse_logs.py --help
+cd parse_logs
+python3 parse_logs.py --help
 ```
 
-`parse_logs.py` is a thin entry point; the logic lives in `log_parser.py`, which
-you can import directly:
+Everything lives in `parse_logs.py`, which is both the entry point and the
+importable module:
 
 ```python
-from log_parser import parse_line, run, make_anonymiser
+from parse_logs import parse_line, run, anonymise
 
 record = parse_line('127.0.0.1 - - [10/Oct/2000:13:55:36 -0700] "GET / HTTP/1.1" 200 2326')
 print(record.status, record.url)          # 200 /
 
-stats = run("access.log", "out.csv", "bad.log",
-            anonymise=make_anonymiser("truncate"))
+stats = run("access.log", "out.csv", "bad.log", redact=anonymise)
 print(stats.parsed, stats.error_rate("5xx"))
 ```
+
+`run()` takes its configuration as arguments — `redact`, `cap`, `assume_tz`,
+`reference_time` — and restores any process-wide state when it returns, so
+calling it in a loop over rotated files behaves the same as calling it once.
 
 ---
 
 ## Usage
 
 ```bash
-python parse_logs.py access.log                  # parse, write parsed_logs.csv
-python parse_logs.py access.log --gzip           # write parsed_logs.csv.gz
-python parse_logs.py access.log --no-csv         # summary only
-python parse_logs.py access.log -o results.csv   # custom output path
-python parse_logs.py access.log --anonymise-ips truncate   # strip client IPs
-python parse_logs.py                             # defaults to server.log
-python -m log_parser access.log                  # equivalent to the above
+python3 parse_logs.py access.log                 # parse, write parsed_logs.csv
+python3 parse_logs.py access.log.gz              # compressed input, read directly
+python3 parse_logs.py access.log --gzip          # write parsed_logs.csv.gz
+python3 parse_logs.py access.log --no-csv        # summary only
+python3 parse_logs.py access.log -o results.csv  # custom output path
+python3 parse_logs.py access.log --redact        # strip client IPs and secrets
+python3 parse_logs.py access.log --assume-tz +0200
+python3 parse_logs.py                            # defaults to server.log
 ```
 
 | Flag | Effect |
 | --- | --- |
-| `logfile` | File to read. Positional, defaults to `server.log`. |
+| `logfile` | File to read. Positional, defaults to `server.log`. Gzip is detected from the file's first bytes, not its name. |
 | `-o`, `--output` | CSV to write. Defaults to `parsed_logs.csv`. |
 | `--skipped` | Where unparseable lines are recorded. Defaults to `skipped_lines.log`. |
 | `--no-csv` | Print the summary only; write no CSV. |
 | `--gzip` | Compress the CSV, appending `.gz` to its name. |
-| `--anonymise-ips` | `none` (default), `truncate` or `hash`. See below. |
-| `--salt` | Salt for `hash` mode. Random per run if omitted. |
+| `--redact` | Mask addresses and obvious secrets everywhere. Off by default. Also accepted as `--anonymise-ips` / `--anonymize-ips`. |
+| `--assume-tz` | Offset to assume for timestamps carrying no zone, e.g. `+0200` or `Z`. Default: leave them as written. |
+| `--counter-cap` | Key limit for the per-IP and per-URL tallies. Default 200,000; `0` removes the limit. |
 | `--version` | Print the version and exit. |
 
-Exit code is `0` on success and `1` if the input file does not exist.
+Exit code is `0` on success and `1` if the input file does not exist or an
+option is malformed.
 
 ---
 
@@ -97,12 +108,15 @@ Every line is tested against these in turn. The first match wins.
 | `json` | One JSON object per line | `{"timestamp":"...","status_code":500,...}` |
 | `combined` | Apache/Nginx combined | `1.2.3.4 - - [10/Oct/2000:13:55:36 -0700] "GET / HTTP/1.1" 200 2326 "-" "curl/8.0"` |
 | `common` | Apache/Nginx common | same, without the referrer and agent |
-| `fixed8` | `DATE TIME LEVEL IP METHOD URL STATUS 123ms` | `2026-07-26 02:51:28 INFO 10.0.0.5 GET /index.html 200 143ms` |
+| `fixed8` | `DATE TIME[ZONE] LEVEL IP METHOD URL STATUS 123ms` | `2026-07-26 02:51:28 INFO 10.0.0.5 GET /index.html 200 143ms` |
 | `generic` | `TIMESTAMP LEVEL message` | `Jul 26 02:51:31 WARN slow for 172.16.0.4 GET /checkout status=503 took 1450 ms` |
 
 The order matters: JSON is unambiguous, `combined`/`common`/`fixed8` are strict,
 and `generic` is the loosest, so it goes last and only sees what the others
-rejected. A test asserts that no pattern ever claims another format's line.
+rejected. A test asserts that the three strict parsers never claim another
+format's line. `generic` is deliberately not held to that: it matches anything
+with a timestamp and a level, including a well-formed `fixed8` line, which is
+exactly why it is last and why format detection pins it there.
 
 Notes on the edges:
 
@@ -111,6 +125,8 @@ Notes on the edges:
   work alongside the Apache standard `[10/Oct/2000:13:55:36 -0700]`.
 - **CLF timing tails** are picked up if your server appends them
   (`... "curl/8.0" 0.250 s`).
+- **`fixed8` may carry a zone** — `+0200`, `+02:00`, `Z` or `UTC` after the
+  time — and is normalised to UTC like every other format.
 - **JSON key names vary by producer**, so aliases are mapped: `remote_addr`,
   `client_ip` and `host` all become `IP`; `status_code`, `response_code` and
   `code` all become `Status`; `latency`, `duration_ms` and `took_ms` all become
@@ -120,7 +136,9 @@ Notes on the edges:
   not a precise parser.
 
 Anything matching nothing at all is written to `skipped_lines.log` with its
-line number, so a bad log is diagnosable rather than merely absent.
+line number, so a bad log is diagnosable rather than merely absent. That file is
+opened only when there is something to put in it, so a clean run leaves the
+previous one intact.
 
 ---
 
@@ -136,27 +154,48 @@ line number, so a bad log is diagnosable rather than merely absent.
 | `IP`, `Method`, `URL` | Empty when the format does not supply them |
 | `Status` | Integer, or empty for lines with no status |
 | `DurationMS` | Whole milliseconds. Seconds are converted; empty if absent |
-| `Bytes` | Response size. A `-` in the log becomes `0` |
+| `Bytes` | Response size. A `-` in the log becomes empty, not `0` — the server did not record a size, which is not the same as sending nothing |
 | `Format` | Which parser handled the row — useful for spotting misdetection |
 
 Timestamps carrying an offset are converted to UTC and the offset preserved, so
-logs collected across regions sort correctly against each other.
+logs collected across regions sort correctly against each other. This applies to
+every format, `fixed8` included. Offsets outside the range real zones occupy
+(−12:00 to +14:00) are rejected rather than applied.
+
+A timestamp with no zone cannot be normalised by anyone — nothing in the file
+says what clock it was written on — so it is left as written with an empty `TZ`.
+Use `--assume-tz` when you know the answer. Sorting the CSV by `TZ` shows you
+immediately whether you have such rows.
 
 ### Summary
 
+- **Successful probes** — requests for scanner paths that were *served* rather
+  than refused, listed first with status, method, path and source. A 200 on
+  `/.env` is the one finding here that may mean a live compromise rather than
+  background noise.
 - **Formats detected** — a breakdown by parser. If you expected one format and
   see two, something upstream changed.
-- **Mean response** — averaged over lines that actually have a duration, not
-  over all lines. Reports `n/a` rather than `0.0` when nothing is timed.
+- **Mean response, median and p95** — over lines that actually have a duration,
+  not over all lines. Reports `n/a` rather than `0.0` when nothing is timed. The
+  percentiles come from a bounded sample and say so once that sample overflows.
 - **Client errors (4xx) / Server errors (5xx)** — as a percentage of lines that
   carry a status. 4xx is the client's fault and mostly noise; 5xx is yours.
-- **Top IPs probing suspicious paths** — 4xx and 5xx hits on paths only a
-  scanner asks for (`.env`, `.git`, `wp-login`, `phpmyadmin` and friends; see
-  `SUSPICIOUS_PATHS`). This is someone testing you.
+- **Top IPs probing suspicious paths** — every request for a path only a scanner
+  asks for (`.env`, `.git`, `wp-login`, `phpmyadmin` and friends; see
+  `SUSPICIOUS_SEGMENTS`), whatever it returned. A 4xx is a probe that bounced;
+  anything else is one that landed.
 - **Top 4xx on real paths** — the same failures on ordinary URLs, which are
   broken links worth fixing. Separating the two is the point: mixed together,
   scanner noise buries the actionable errors.
 - **Top IPs / URLs** — ordinary traffic distribution.
+
+Paths are matched by whole segment, not by substring, so `/docs/.environment`
+and `/blog/using.gitlab-ci` are not mistaken for scans. Percent-encoded and
+backslash forms still are.
+
+Sections whose tallies hit the key cap are marked `[capped]`, and the unique-IP
+figure is then reported as a range rather than a number the counter cannot
+support. Use `--counter-cap 0` when you need it exact.
 
 ---
 
@@ -187,8 +226,8 @@ Practical points if you run this on production logs:
   effectively permanent and widely copied, which makes erasure requests
   (Art. 17) painful. The supplied `.gitignore` blocks `*.log`,
   `parsed_logs.csv*` and `skipped_lines.log` for this reason.
-- **Anonymise or pseudonymise when you can**, using `--anonymise-ips`. For
-  traffic analysis you rarely need full addresses. See the next section.
+- **Redact when you can**, using `--redact`. For traffic analysis you rarely
+  need full addresses. See the next section.
 - **Share summaries, not rows.** The `--no-csv` summary contains aggregates plus
   a top-10 of IPs. Dropping that section leaves output that is not personal data
   at all and is safe to paste into a ticket or chat.
@@ -196,50 +235,46 @@ Practical points if you run this on production logs:
   activity, and belongs in your Art. 30 records with its purpose and retention
   period.
 
-### Anonymising IPs
+### Redacting
 
 Off by default: an incident investigation needs full addresses, so the tool
-reproduces whatever the source log contains unless you ask otherwise. Both modes
-rewrite addresses before they reach the CSV, the summary **or**
-`skipped_lines.log`, so no raw address survives anywhere in the output. A test
-asserts exactly that.
+reproduces whatever the source log contains unless you ask otherwise.
 
-```bash
-python parse_logs.py access.log --anonymise-ips truncate
-python parse_logs.py access.log --anonymise-ips hash
-python parse_logs.py access.log --anonymise-ips hash --salt "$IP_SALT"
-```
+`--redact` rewrites text on its way to every output — the CSV, the printed
+summary **and** `skipped_lines.log` — rather than masking parsed fields. That
+distinction is the whole point: skipped lines never become a parsed record, and
+a malformed address is a common reason a line fails to parse, so field-level
+masking would systematically miss the addresses most in need of it. A test
+asserts no raw address survives in any output file.
 
-| Mode | `192.168.239.106` becomes | Keeps | Loses |
+| What | `203.0.113.47` / `2001:db8:1:2::5` becomes | Keeps | Loses |
 | --- | --- | --- | --- |
-| `truncate` | `192.168.239.0` | Network and rough geography | Per-client counts within a /24 |
-| `hash` | `ip_2ce89e8c372d` | Per-client counts, exactly | Any network or geographic meaning |
+| IPv4 | `203.0.113.0` (a /24) | Network and rough geography | Per-client counts within a /24 |
+| IPv6 | `2001:db8:1::` (a /48) | Routing prefix | Per-client counts within a /48 |
 
-**`truncate`** zeroes the host portion: IPv4 to a /24, IPv6 to a /48. This is the
-usual analytics recipe and the stronger of the two, because the discarded bits
-are gone rather than merely obscured. Hostnames, which some servers log instead
-of addresses, have no meaningful network portion, so they are hashed instead of
-passed through.
+Also masked: e-mail local parts (`jane@corp.com` → `***@corp.com`, domain kept
+for triage), `Bearer` and `Basic` credentials, and credential-shaped
+`key=value` pairs — `token`, `session`, `api_key`, `password`, `signature` and
+similar. Brackets and ports on IPv6 addresses survive; zone IDs are dropped.
+IPv4-mapped addresses are masked inside the mapping, so `::ffff:203.0.113.47`
+becomes `::ffff:203.0.113.0` rather than collapsing to a bare `::`.
 
-**`hash`** is a salted HMAC-SHA256, truncated to 12 hex characters. Distinct
-clients stay distinct, so probe detection and top-IP counts remain exact — the
-right choice when you need to know *that* one client hit you 4,000 times but not
-*who* they are.
+Two things to understand:
 
-Two things to understand about `hash`:
+- **Truncation aggregates clients.** Everything on one /24 or /48 becomes one
+  key, so per-IP probe counts and top-IP rankings stop being per-client after
+  redaction. A residential /48 can be a whole household. There is no mode that
+  preserves per-client counts while hiding identity; if you need that, see
+  *Not implemented* below.
+- **It is best-effort.** It knows about addresses, e-mail local parts and the
+  key names in `SECRET_KV_RE`. A log carrying identifiers in some other shape —
+  a customer number, a session ID under an unusual name, a token in a URL path —
+  still carries them afterwards. Spot-check `skipped_lines.log` before sharing
+  it.
 
-- **It is pseudonymisation, not anonymisation.** The data stays in scope under
-  the GDPR. IPv4 is only ~4.3 billion values, so anyone holding the salt can
-  recover every address by brute force in minutes. **Treat the salt as a
-  secret** — it belongs in a secrets manager, not in a shell history or a
-  scheduled job's command line.
-- **The salt is random per run unless you supply one.** That is deliberate:
-  random salts prevent correlating one day's output against another's. Supply a
-  fixed `--salt` only when you genuinely need to track a client across runs, and
-  accept that a long-lived salt weakens the pseudonym over time.
-
-Neither mode touches URLs. A path with an email address or token in the query
-string is still personal data, and this tool will not save you from that.
+Neither redaction nor anything else here touches URL *paths*. A path with an
+email address or token in it is still personal data, and this tool will not save
+you from that.
 
 None of the above is legal advice. Your DPO or counsel decides what your
 organisation actually needs.
@@ -250,18 +285,30 @@ organisation actually needs.
 
 **The CSV is written atomically.** Output goes to a `.tmp` file that is only
 swapped into place with `os.replace()` once the run completes. A crash partway
-leaves any previous CSV untouched rather than half-overwritten. There is a test
-for this.
+leaves any previous CSV untouched rather than half-overwritten, and removes its
+own temporary file on the way out. There are tests for both.
 
-**Format detection is sampled.** The first 50 lines decide which parser to try
-first, so a uniform file avoids up to three failed regex attempts per line. The
-order is a performance hint only — results are identical either way, which is
-also tested.
+**Format detection is sampled.** The first 50 lines decide which of the strict
+parsers to try first, so a uniform file avoids up to three failed regex attempts
+per line. `parse_generic` is pinned last regardless of what the sample says,
+because it matches almost anything: promoting it would let it swallow lines a
+stricter parser would have read properly. With that pin the order is a pure
+performance hint — results are identical either way, which is tested.
 
-**Counters are capped.** A log with millions of unique URLs would grow the
-tallies without bound, so `CappedCounter` prunes its long tail past 200,000
-keys. Counts for surviving keys stay exact; only entries too rare to ever
-appear in a top-10 are dropped.
+**Counters are capped, and say when they are.** A log with millions of unique
+URLs would grow the tallies without bound, so `CappedCounter` prunes its long
+tail past 200,000 keys. Counts for surviving keys stay exact. Past the cap the
+unique-IP figure becomes a range rather than a number, because `len()` is then
+the number of keys *held*, not the number seen.
+
+**Percentiles come from a reservoir.** Exact percentiles need every value;
+holding a few million integers is avoidable, so past 50,000 durations the sample
+becomes a uniform random subset and the summary labels the result an estimate.
+
+**Year-less dates are read against the file's age.** Syslog omits the year, so
+the log file's modification time supplies it, stepping back one year if that
+would place a line in the future. A December line parsed in January belongs to
+the year it was written.
 
 **Decoding never fails the run.** Input is read with `errors="replace"`, so one
 bad byte costs one line rather than the whole job.
@@ -271,16 +318,22 @@ bad byte costs one line rather than the whole job.
 ## Testing
 
 ```bash
-python -m unittest -v          # 64 tests
-python -m unittest test_parse_logs.TestParsers    # one class
+python3 -m unittest test_parse_logs -v                   # 59 tests
+python3 -m unittest test_parse_logs.TestTimestamps       # one class
 ```
 
 The suite covers timestamp handling across formats and offsets, unit
 conversion, each parser against a realistic sample line, cross-format
-contamination, counter pruning, the statistics maths, both anonymisation modes
-including a leak check across every output file, and end-to-end runs covering
-gzip output, binary junk, and the atomic-write guarantee. No network
-or fixture files needed — samples are inline and temp files are used throughout.
+contamination, detection-order invariance, counter pruning and its bounds,
+percentile sampling, redaction including a leak check across every output file,
+configuration isolation between runs, and end-to-end runs covering gzip input
+and output, binary junk, the atomic-write guarantee and temporary-file cleanup.
+No network or fixture files needed — samples are inline and temp files are used
+throughout.
+
+Every test corresponds to a defect that was actually found. Each was checked by
+reintroducing the original bug and confirming the suite fails, so the coverage
+is against real defects rather than against whatever the code happens to do now.
 
 ---
 
@@ -293,7 +346,22 @@ automatically.
 
 **To recognise more JSON keys:** add aliases to `JSON_KEYS`.
 
-**To change what counts as a probe:** edit `SUSPICIOUS_PATHS`.
+**To change what counts as a probe:** edit `SUSPICIOUS_SEGMENTS` for single path
+components and `SUSPICIOUS_SEQUENCES` for multi-segment ones.
+
+**To change how much of an address survives redaction:** edit `IPV4_MASK_BITS`
+and `IPV6_MASK_BITS`. Widening the IPv6 value to 64 separates households on a
+residential prefix, at the cost of some anonymity.
+
+---
+
+## Not implemented
+
+- **A hash / pseudonymisation mode.** There is no `--salt` and no HMAC option,
+  so there is currently no way to keep distinct clients distinct while hiding
+  who they are. Truncation is the only mode.
+- **A `log_parser.py` / `parse_logs.py` module split.** Everything is one file;
+  `python -m log_parser` does not work.
 
 ---
 
@@ -302,23 +370,25 @@ automatically.
 - Multi-line entries such as stack traces are not joined; each line is judged
   alone, so continuation lines land in `skipped_lines.log`.
 - The `generic` parser infers fields from prose and can pick the wrong IP.
-- Timestamps without a year (syslog style) inherit the current year, which is
-  wrong for logs that span a New Year boundary.
+- Timestamps with no zone cannot be reconciled without `--assume-tz`.
+- Throughput is around 26,000 lines a second (37 MB peak on a 200,000-line
+  file). Fine for a day of traffic; a 50-million-line archive is about half an
+  hour. The regex-per-line design is the ceiling.
 - Everything is a single pass in one process. It is I/O-bound and fine for
   large files, but there is no parallelism.
+- No real-world log has been through it. Every test fixture was written to
+  reproduce a known bug, which cannot surface a format quirk nobody
+  anticipated. The `skipped_lines.log` count on one of your own files is the
+  honest measure.
 
 ---
 
 ## Project structure
 
 ```
-log_parser.py         the library: parsers, stats, anonymisation, CLI
-parse_logs.py         entry point, calls log_parser.main()
+parse_logs.py         parsers, stats, redaction, CLI — the whole tool
 test_parse_logs.py    unittest suite
 README.md             this file
+RELEASE.md            release notes
 .gitignore
 ```
-
-The split follows the usual convention: a noun for the importable module, a verb
-for the thing you run. Both names work, so existing `parse_logs.py` invocations
-keep going.
